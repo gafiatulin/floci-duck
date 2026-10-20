@@ -12,6 +12,7 @@ A lightweight DuckDB-powered executor sidecar for [Floci](https://github.com/flo
 - **Firehose Mode**: Direct SQL execution for DDL/DML operations.
 - **Athena Mode**: Automated query result export to S3 in CSV format (similar to AWS Athena).
 - **S3 Select Mode**: Execute a query and return rows as JSON via `/query`.
+- **BigQuery compatibility functions**: Built-in shims cover FarmHash, IP helpers, JSON arrays, and `TO_JSON_STRING`-style serialization.
 - **Parquet Support**: Read and write Parquet files directly from/to S3.
 - **Correlation ID Tracing**: Every request is tagged with a correlation ID propagated through all log lines.
 - **Lightweight**: Written in Rust for minimal overhead and high performance.
@@ -42,15 +43,45 @@ cargo build --release
 
 ### Startup behaviour
 
-On startup, floci-duck runs a **preflight check** that installs the `httpfs` DuckDB extension to local disk. This ensures every subsequent request can load the extension instantly without a network download.
+On startup, floci-duck runs a **preflight check** that installs the `httpfs` and `icu` DuckDB
+extensions to local disk. This ensures every subsequent request can load the extension instantly
+without a network download.
 
 ```
-INFO floci_duck::executor: Preflight: installing httpfs extension...
-INFO floci_duck::executor: Preflight: httpfs installed successfully
+INFO floci_duck::executor: Preflight: installing DuckDB extensions...
+INFO floci_duck::executor: Preflight: DuckDB extensions installed successfully
 INFO floci_duck: Starting floci-duck sidecar on 0.0.0.0:3000
 ```
 
-If the preflight fails (e.g. no network on first boot), a warning is logged and the extension is installed on the first request that needs it.
+If the preflight fails (for example, there is no network on first boot), a warning is logged and
+`httpfs` is installed on the first request that needs S3 access.
+
+---
+
+## SQL compatibility helpers
+
+Each request receives a fresh in-memory DuckDB connection with the following compatibility
+helpers registered. Function names are case-insensitive, as in DuckDB. They are intended for
+SQL translated from BigQuery; the `floci_` names below are also available when issuing DuckDB SQL
+directly.
+
+| Helper | Inputs and behavior |
+| :--- | :--- |
+| `farm_fingerprint(value)` | FarmHash Fingerprint64 for `VARCHAR` or `BLOB`; returns signed `BIGINT`, matching BigQuery `FARM_FINGERPRINT`. |
+| `ip_from_string(text)`, `safe_ip_from_string(text)` | Parse IPv4 or IPv6 text into a 4- or 16-byte `BLOB`. The `safe_` form returns `NULL` for invalid input; the other form errors. |
+| `ip_to_string(bytes)` | Render a 4- or 16-byte IP `BLOB`; other widths are errors. |
+| `ip_trunc(bytes, prefix_length)` | Zero host bits in a 4- or 16-byte IP `BLOB`; validates the prefix length. |
+| `json_extract_array(input[, path])` | Returns a list suitable for `UNNEST`; a `VARCHAR` input returns `VARCHAR[]` and a `JSON` input returns `JSON[]`. The default path is `$`. |
+| `floci_to_json_string(value[, pretty_print])` | Serializes scalars and nested DuckDB values to JSON. `TIMESTAMPTZ` values are UTC ISO-8601 strings; `TIMESTAMP` values have no offset. `NULL` input (or `NULL` `pretty_print`) returns `NULL`. |
+
+For example:
+
+```sql
+SELECT
+  farm_fingerprint('1footrue'),
+  ip_to_string(ip_from_string('192.0.2.1')),
+  floci_to_json_string({'at': TIMESTAMPTZ '2024-01-02 03:04:05+00'});
+```
 
 ---
 
