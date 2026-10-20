@@ -1,15 +1,15 @@
 use crate::models::{ArrowIpc, ArrowIpcBatch, Column, ExecuteRequest, QueryRequest, QueryResult};
+use duckdb::Connection;
 use duckdb::arrow::array::{
     Array as ArrowArray, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray,
-    FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    FixedSizeListArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
     LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, MapArray, StringArray,
-    StructArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use duckdb::arrow::datatypes::DataType;
 use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
 use duckdb::core::LogicalTypeId;
-use duckdb::Connection;
 use std::env;
 use tracing::info;
 
@@ -247,7 +247,7 @@ pub fn execute_query_returning(req: QueryRequest) -> anyhow::Result<QueryOutput>
 /// Runs one statement and returns its result as Arrow IPC messages instead of JSON rows.
 fn run_statement_arrow(conn: &Connection, sql: &str) -> anyhow::Result<(Vec<Column>, ArrowIpc)> {
     use arrow_ipc::writer::{
-        write_message, CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+        CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message,
     };
 
     let mut stmt = conn.prepare(sql)?;
