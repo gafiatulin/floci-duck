@@ -17,6 +17,619 @@ use std::env;
 use std::ffi::CStr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tracing::info;
+use zetasketch_rs::{Aggregator, HyperLogLogPlusPlus};
+
+struct FlociByteLength;
+
+impl VScalar for FlociByteLength {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let vector = input.flat_vector(0);
+        let values = unsafe { vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let mut output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if vector.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let mut value = *value;
+            unsafe {
+                *output.as_mut_ptr::<i64>().add(index) =
+                    DuckString::new(&mut value).as_bytes().len() as i64;
+            }
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![LogicalTypeId::Varchar, LogicalTypeId::Blob]
+            .into_iter()
+            .map(|input| {
+                ScalarFunctionSignature::exact(vec![input.into()], LogicalTypeId::Bigint.into())
+            })
+            .collect()
+    }
+}
+
+struct FlociLength;
+
+impl VScalar for FlociLength {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use duckdb::ffi;
+
+        let input_vector = unsafe { ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 0) };
+        let mut input_type = unsafe { ffi::duckdb_vector_get_column_type(input_vector) };
+        let input_type_id = LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(input_type) });
+        let vector = input.flat_vector(0);
+        let values =
+            unsafe { vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(input.len()) };
+        let mut output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if vector.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let mut value = *value;
+            let mut value = DuckString::new(&mut value);
+            let length = if input_type_id == LogicalTypeId::Blob {
+                value.as_bytes().len()
+            } else {
+                value.as_str().chars().count()
+            };
+            unsafe {
+                *output.as_mut_ptr::<i64>().add(index) = length as i64;
+            }
+        }
+        unsafe {
+            ffi::duckdb_destroy_logical_type(&mut input_type);
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![LogicalTypeId::Varchar, LogicalTypeId::Blob]
+            .into_iter()
+            .map(|input| {
+                ScalarFunctionSignature::exact(vec![input.into()], LogicalTypeId::Bigint.into())
+            })
+            .collect()
+    }
+}
+
+struct BlobShiftLeft;
+
+impl VScalar for BlobShiftLeft {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let blobs = input.flat_vector(0);
+        let shifts = input.flat_vector(1);
+        let values = unsafe { blobs.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let shift_values = unsafe { shifts.as_slice_with_len::<i64>(len) };
+        let mut output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if blobs.row_is_null(index as u64) || shifts.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let shift = shift_values[index];
+            if shift < 0 {
+                return Err("BYTES shift count must not be negative".into());
+            }
+            let mut value = *value;
+            let source = DuckString::new(&mut value).as_bytes();
+            let mut shifted = vec![0; source.len()];
+            let byte_shift = (shift / 8) as usize;
+            let bit_shift = (shift % 8) as u32;
+            for (target, byte) in shifted.iter_mut().enumerate() {
+                let source_index = target + byte_shift;
+                if source_index >= source.len() {
+                    break;
+                }
+                *byte = source[source_index] << bit_shift;
+                if bit_shift != 0 && source_index + 1 < source.len() {
+                    *byte |= source[source_index + 1] >> (8 - bit_shift);
+                }
+            }
+            output.insert(index, &shifted);
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into(), LogicalTypeId::Bigint.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+struct BlobBitAnd;
+
+impl VScalar for BlobBitAnd {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let left = input.flat_vector(0);
+        let right = input.flat_vector(1);
+        let left_values = unsafe { left.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let right_values = unsafe { right.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let mut output = output.flat_vector();
+        for index in 0..len {
+            if left.row_is_null(index as u64) || right.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let mut left_value = left_values[index];
+            let mut right_value = right_values[index];
+            let left_bytes = DuckString::new(&mut left_value).as_bytes();
+            let right_bytes = DuckString::new(&mut right_value).as_bytes();
+            if left_bytes.len() != right_bytes.len() {
+                return Err("BYTES bitwise operands must have equal lengths".into());
+            }
+            let value: Vec<u8> = left_bytes
+                .iter()
+                .zip(right_bytes)
+                .map(|(left, right)| left & right)
+                .collect();
+            output.insert(index, &value);
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into(), LogicalTypeId::Blob.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+struct BlobBitCount;
+
+impl VScalar for BlobBitCount {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let vector = input.flat_vector(0);
+        let values = unsafe { vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let mut output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if vector.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let mut value = *value;
+            let count: i64 = DuckString::new(&mut value)
+                .as_bytes()
+                .iter()
+                .map(|byte| i64::from(byte.count_ones()))
+                .sum();
+            unsafe { *output.as_mut_ptr::<i64>().add(index) = count };
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into()],
+            LogicalTypeId::Bigint.into(),
+        )]
+    }
+}
+
+struct BlobRepeat;
+
+impl VScalar for BlobRepeat {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let values_vector = input.flat_vector(0);
+        let counts_vector = input.flat_vector(1);
+        let values =
+            unsafe { values_vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let counts = unsafe { counts_vector.as_slice_with_len::<i64>(len) };
+        let mut output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if values_vector.row_is_null(index as u64) || counts_vector.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            if counts[index] < 0 {
+                return Err("BYTES repeat count must not be negative".into());
+            }
+            let mut value = *value;
+            output.insert(
+                index,
+                DuckString::new(&mut value)
+                    .as_bytes()
+                    .repeat(counts[index] as usize)
+                    .as_slice(),
+            );
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into(), LogicalTypeId::Bigint.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+struct BlobConcat;
+
+impl VScalar for BlobConcat {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let vectors: Vec<_> = (0..input.num_columns())
+            .map(|column| input.flat_vector(column))
+            .collect();
+        let values: Vec<_> = vectors
+            .iter()
+            .map(|vector| unsafe {
+                vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(input.len())
+            })
+            .collect();
+        let mut output = output.flat_vector();
+        for index in 0..input.len() {
+            if vectors
+                .iter()
+                .any(|vector| vector.row_is_null(index as u64))
+            {
+                output.set_null(index);
+                continue;
+            }
+            let mut concatenated = Vec::new();
+            for column in &values {
+                let mut value = column[index];
+                concatenated.extend_from_slice(DuckString::new(&mut value).as_bytes());
+            }
+            output.insert(index, &concatenated);
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        (2..=8)
+            .map(|arity| {
+                ScalarFunctionSignature::exact(
+                    (0..arity).map(|_| LogicalTypeId::Blob.into()).collect(),
+                    LogicalTypeId::Blob.into(),
+                )
+            })
+            .collect()
+    }
+}
+
+struct FlociHllInit;
+
+impl VScalar for FlociHllInit {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use duckdb::ffi;
+
+        let values_vector = unsafe { ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 0) };
+        let mut values_type = unsafe { ffi::duckdb_vector_get_column_type(values_vector) };
+        let precision_vector = input.flat_vector(1);
+        let precisions = unsafe { precision_vector.as_slice_with_len::<i32>(input.len()) };
+        let mut output = output.flat_vector();
+
+        let result: Result<(), Box<dyn std::error::Error>> = (|| {
+            for (index, precision) in precisions.iter().enumerate().take(input.len()) {
+                if raw_vector_is_null(values_vector, index)
+                    || precision_vector.row_is_null(index as u64)
+                {
+                    output.set_null(index);
+                    continue;
+                }
+                match hll_init_list(values_vector, values_type, index, *precision)? {
+                    Some(sketch) => output.insert(index, &sketch),
+                    None => output.set_null(index),
+                }
+            }
+            Ok(())
+        })();
+        unsafe {
+            ffi::duckdb_destroy_logical_type(&mut values_type);
+        }
+        result
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Any.into(), LogicalTypeId::Integer.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+struct FlociHllExtract;
+
+impl VScalar for FlociHllExtract {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let input_vector = input.flat_vector(0);
+        let values =
+            unsafe { input_vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(input.len()) };
+        let output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if input_vector.row_is_null(index as u64) {
+                unsafe { *output.as_mut_ptr::<i64>().add(index) = 0 };
+                continue;
+            }
+            let mut value = *value;
+            let sketch = parse_hll(DuckString::new(&mut value).as_bytes())?;
+            unsafe { *output.as_mut_ptr::<i64>().add(index) = sketch.result()? };
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into()],
+            LogicalTypeId::Bigint.into(),
+        )]
+    }
+}
+
+struct FlociHllMerge;
+
+impl VScalar for FlociHllMerge {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        invoke_hll_merge(input, output, false)
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Any.into()],
+            LogicalTypeId::Bigint.into(),
+        )]
+    }
+}
+
+struct FlociHllMergePartial;
+
+impl VScalar for FlociHllMergePartial {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        invoke_hll_merge(input, output, true)
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Any.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+fn hll_init_list(
+    vector: duckdb::ffi::duckdb_vector,
+    logical_type: duckdb::ffi::duckdb_logical_type,
+    index: usize,
+    precision: i32,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    use duckdb::ffi;
+
+    if LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(logical_type) }) != LogicalTypeId::List
+    {
+        return Err("floci_hll_init requires a LIST argument".into());
+    }
+    let entry = unsafe { raw_vector_value::<ffi::duckdb_list_entry>(vector, index) };
+    // HLL_COUNT.INIT is NULL for an aggregate group with no non-NULL inputs.
+    // The translator removes NULLs before calling this scalar shim, so an empty
+    // list represents both the all-NULL and empty-input aggregate cases.
+    if entry.length == 0 {
+        return Ok(None);
+    }
+    let child_vector = unsafe { ffi::duckdb_list_vector_get_child(vector) };
+    let mut child_type = unsafe { ffi::duckdb_list_type_child_type(logical_type) };
+    let child_type_id = LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(child_type) });
+
+    let result =
+        (|| {
+            let builder = HyperLogLogPlusPlus::builder().normal_precision(precision);
+            let mut sketch = match child_type_id {
+                LogicalTypeId::Varchar => builder.build_for_string()?,
+                LogicalTypeId::Blob => builder.build_for_bytes()?,
+                LogicalTypeId::Tinyint
+                | LogicalTypeId::Smallint
+                | LogicalTypeId::Integer
+                | LogicalTypeId::Bigint => builder.build_for_u64()?,
+                other => return Err(format!("HLL_COUNT.INIT does not support {other:?}").into()),
+            };
+
+            for child_index in entry.offset..entry.offset + entry.length {
+                let child_index = child_index as usize;
+                if raw_vector_is_null(child_vector, child_index) {
+                    continue;
+                }
+                match child_type_id {
+                    LogicalTypeId::Varchar => {
+                        let mut value = unsafe {
+                            raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index)
+                        };
+                        sketch.add_string(DuckString::new(&mut value).as_str().as_ref())?;
+                    }
+                    LogicalTypeId::Blob => {
+                        let mut value = unsafe {
+                            raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index)
+                        };
+                        sketch.add_bytes(DuckString::new(&mut value).as_bytes())?;
+                    }
+                    LogicalTypeId::Tinyint => {
+                        sketch.add_i64(
+                            unsafe { raw_vector_value::<i8>(child_vector, child_index) } as i64,
+                        )?
+                    }
+                    LogicalTypeId::Smallint => sketch.add_i64(unsafe {
+                        raw_vector_value::<i16>(child_vector, child_index)
+                    } as i64)?,
+                    LogicalTypeId::Integer => sketch.add_i64(unsafe {
+                        raw_vector_value::<i32>(child_vector, child_index)
+                    } as i64)?,
+                    LogicalTypeId::Bigint => sketch
+                        .add_i64(unsafe { raw_vector_value::<i64>(child_vector, child_index) })?,
+                    _ => unreachable!(),
+                }
+            }
+            Ok(Some(sketch.serialize_to_bytes()?))
+        })();
+    unsafe {
+        ffi::duckdb_destroy_logical_type(&mut child_type);
+    }
+    result
+}
+
+fn parse_hll(bytes: &[u8]) -> Result<HyperLogLogPlusPlus, Box<dyn std::error::Error>> {
+    Ok(HyperLogLogPlusPlus::from_bytes(bytes)?)
+}
+
+fn merged_hll_list(
+    vector: duckdb::ffi::duckdb_vector,
+    logical_type: duckdb::ffi::duckdb_logical_type,
+    index: usize,
+) -> Result<Option<HyperLogLogPlusPlus>, Box<dyn std::error::Error>> {
+    use duckdb::ffi;
+
+    if LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(logical_type) }) != LogicalTypeId::List
+    {
+        return Err("HLL_COUNT.MERGE requires a LIST argument".into());
+    }
+    let entry = unsafe { raw_vector_value::<ffi::duckdb_list_entry>(vector, index) };
+    let child_vector = unsafe { ffi::duckdb_list_vector_get_child(vector) };
+    let mut child_type = unsafe { ffi::duckdb_list_type_child_type(logical_type) };
+    let child_type_id = LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(child_type) });
+    if child_type_id != LogicalTypeId::Blob {
+        unsafe { ffi::duckdb_destroy_logical_type(&mut child_type) };
+        return Err(format!("HLL_COUNT.MERGE requires BYTES, found {child_type_id:?}").into());
+    }
+
+    let result = (|| {
+        let mut merged: Option<HyperLogLogPlusPlus> = None;
+        for child_index in entry.offset..entry.offset + entry.length {
+            let child_index = child_index as usize;
+            if raw_vector_is_null(child_vector, child_index) {
+                continue;
+            }
+            let mut value =
+                unsafe { raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index) };
+            let sketch = parse_hll(DuckString::new(&mut value).as_bytes())?;
+            if let Some(current) = &mut merged {
+                current.merge_aggregator(sketch)?;
+            } else {
+                merged = Some(sketch);
+            }
+        }
+        Ok(merged)
+    })();
+    unsafe {
+        ffi::duckdb_destroy_logical_type(&mut child_type);
+    }
+    result
+}
+
+fn invoke_hll_merge(
+    input: &mut DataChunkHandle,
+    output: &mut dyn WritableVector,
+    partial: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use duckdb::ffi;
+
+    let input_vector = unsafe { ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 0) };
+    let mut input_type = unsafe { ffi::duckdb_vector_get_column_type(input_vector) };
+    let mut output = output.flat_vector();
+    let result = (|| {
+        for index in 0..input.len() {
+            if raw_vector_is_null(input_vector, index) {
+                if partial {
+                    output.set_null(index);
+                } else {
+                    unsafe { *output.as_mut_ptr::<i64>().add(index) = 0 };
+                }
+                continue;
+            }
+            let merged = merged_hll_list(input_vector, input_type, index)?;
+            if partial {
+                match merged {
+                    Some(sketch) => output.insert(index, &sketch.serialize_to_bytes()?),
+                    None => output.set_null(index),
+                }
+            } else {
+                let estimate = match merged {
+                    Some(sketch) => sketch.result()?,
+                    None => 0,
+                };
+                unsafe { *output.as_mut_ptr::<i64>().add(index) = estimate };
+            }
+        }
+        Ok(())
+    })();
+    unsafe {
+        ffi::duckdb_destroy_logical_type(&mut input_type);
+    }
+    result
+}
 
 struct IpToString;
 
@@ -626,6 +1239,17 @@ fn open_conn() -> anyhow::Result<Connection> {
     conn.register_scalar_function::<IpTrunc>("ip_trunc")?;
     conn.register_scalar_function::<FarmFingerprint>("farm_fingerprint")?;
     conn.register_scalar_function::<FlociToJsonString>("floci_to_json_string")?;
+    conn.register_scalar_function::<FlociByteLength>("floci_byte_length")?;
+    conn.register_scalar_function::<FlociLength>("floci_length")?;
+    conn.register_scalar_function::<BlobShiftLeft>("<<")?;
+    conn.register_scalar_function::<BlobBitAnd>("&")?;
+    conn.register_scalar_function::<BlobBitCount>("bit_count")?;
+    conn.register_scalar_function::<BlobRepeat>("repeat")?;
+    conn.register_scalar_function::<BlobConcat>("concat")?;
+    conn.register_scalar_function::<FlociHllInit>("floci_hll_init")?;
+    conn.register_scalar_function::<FlociHllExtract>("floci_hll_extract")?;
+    conn.register_scalar_function::<FlociHllMerge>("floci_hll_merge")?;
+    conn.register_scalar_function::<FlociHllMergePartial>("floci_hll_merge_partial")?;
     if let Ok(ext_dir) = env::var("FLOCI_DUCK_EXT_DIR") {
         info!("Setting extension directory to: {}", ext_dir);
         conn.execute_batch(&format!(
@@ -1472,6 +2096,125 @@ mod tests {
         assert_eq!(bytes, first);
         assert_eq!(null_string, None);
         assert_eq!(null_bytes, None);
+    }
+
+    #[test]
+    fn test_hll_functions_use_bigquery_compatible_zetasketch_bytes() {
+        let conn = open_conn().unwrap();
+        let (serialized, extracted, merged_raw): (String, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    to_base64(floci_hll_init(['ip1'], 15)),
+                    floci_hll_extract(from_base64('CHAQARgCIAuCBwsQARgPIBQyA9bwNQ==')),
+                    floci_hll_merge([
+                        from_base64('CHAQARgCIAiCBwsQARgPIBQyA5ajLg=='),
+                        from_base64('CHAQAhgCIAiCBw8QAhgPIBQyB6z8INWlrwE=')
+                    ])",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(serialized, "CHAQARgCIAuCBwsQARgPIBQyA9bwNQ==");
+        assert_eq!(extracted, 1);
+        assert_eq!(merged_raw, 3);
+        assert!(parse_hll(b"CHAQARgCIAuCBwsQARgPIBQyA9bwNQ==").is_err());
+    }
+
+    #[test]
+    fn test_length_functions_distinguish_characters_from_bytes() {
+        let conn = open_conn().unwrap();
+        let lengths: (i64, i64, i64, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                   floci_length('hé'),
+                   floci_length(from_hex('00FF')),
+                   floci_byte_length('hé'),
+                   floci_byte_length(from_hex('00FF')),
+                   floci_length('é'),
+                   floci_byte_length('é'),
+                   floci_length('👨‍👩‍👧‍👦'),
+                   floci_byte_length('👨‍👩‍👧‍👦')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(lengths, (2, 2, 3, 2, 2, 3, 7, 25));
+    }
+
+    #[test]
+    fn test_hll_functions_compose_through_an_aggregate_cte() {
+        let conn = open_conn().unwrap();
+        let (extracted, merged): (i64, i64) = conn
+            .query_row(
+                "WITH users(name) AS (VALUES ('ana'), ('bo'), ('cyd')),
+                 sketches AS (
+                   SELECT floci_hll_init(
+                     list_filter(list(DISTINCT name), value -> value IS NOT NULL), 20
+                   ) AS sketch
+                   FROM users
+                 )
+                 SELECT floci_hll_extract(sketch),
+                   (SELECT floci_hll_merge(list(value))
+                    FROM UNNEST([sketch, sketch]) AS values(value))
+                 FROM sketches",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(extracted, 3);
+        assert_eq!(merged, 3);
+    }
+
+    #[test]
+    fn test_hll_init_returns_null_without_non_null_inputs() {
+        let conn = open_conn().unwrap();
+        let (all_null, no_rows): (Option<Vec<u8>>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT
+                   floci_hll_init(list_filter(list(value), value -> value IS NOT NULL), 15),
+                   (SELECT floci_hll_init(list_filter(list(value), value -> value IS NOT NULL), 15)
+                    FROM (SELECT 'never' AS value WHERE FALSE))
+                 FROM (VALUES (CAST(NULL AS VARCHAR))) AS inputs(value)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(all_null, None);
+        assert_eq!(no_rows, None);
+    }
+
+    #[test]
+    fn test_blob_bitwise_operators_preserve_width_and_use_big_endian_bits() {
+        let conn = open_conn().unwrap();
+        let (shifted, masked, bit_is_set): (Vec<u8>, Vec<u8>, bool) = conn
+            .query_row(
+                "SELECT FROM_HEX('0102') << 4,
+                        FROM_HEX('12f0') & FROM_HEX('0ff0'),
+                        BIT_COUNT(FROM_HEX('10') &
+                          (concat(repeat(FROM_HEX('00'), 0), FROM_HEX('01')) << 4)) != 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(shifted, vec![0x10, 0x20]);
+        assert_eq!(masked, vec![0x02, 0xf0]);
+        assert!(bit_is_set);
     }
 
     #[test]
